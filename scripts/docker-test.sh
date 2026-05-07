@@ -189,10 +189,20 @@ run_case "timeout: bridge loop killed" \
     '{"code":"import numpy as np\nwhile True:\n    np.dot(np.array([1.,2.]), np.array([3.,4.]))","timeout_sec":2}' \
     '"status":"error"|"timing"'
 
-# ---------- error surface ----------
+# ---------- error surface + reliability polish ----------
 run_case "user runtime error reported" \
     '{"code":"x = 1/0"}' \
-    'ZeroDivisionError|"status":"error"'
+    'ZeroDivisionError'
+
+run_case "response carries trace_id" \
+    '{"code":"print(1)"}' \
+    '"trace_id":"[a-f0-9]+"'
+
+# error field surfaces the user-facing Python exception, not wazero's
+# "module closed with exit_code(1)" internal noise.
+run_case "error envelope is friendly (no wazero noise)" \
+    '{"code":"x = 1/0"}' \
+    '"error":"ZeroDivisionError'
 
 # Sync-only scope: passing a callable to a bridged function must fail at the
 # shim with a clear TypeError, not silently misbehave on the worker side.

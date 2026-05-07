@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +19,16 @@ import (
 	"github.com/bkmashiro/chrysalis/internal/handler"
 	"github.com/bkmashiro/chrysalis/internal/pool"
 )
+
+func init() {
+	// Default to JSON-structured logs on stderr for production-friendly
+	// ingestion. Each line carries level, ts, msg and any contextual
+	// attributes the call site supplied. Tests grep stdout from container
+	// logs; either format is greppable.
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+}
 
 func main() {
 	if len(os.Args) < 2 {
