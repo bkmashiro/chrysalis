@@ -39,8 +39,16 @@ The server listens on `http://localhost:8080`.
 ### 4. Test
 
 ```bash
-make test-local
+make test-local      # quick curl smoke test against a running server
+make docker-test     # full end-to-end suite in Docker (16 cases)
 ```
+
+`make docker-test` builds an image with all deps (numpy/scipy/pandas), starts
+the server in a container, and exercises every documented path: pure Python,
+numpy/scipy bridge, ndarray round-trip via shm, filter denial, safety
+pre-check, alternate profiles, timeout, and runtime errors. Use
+`KEEP_RUNNING=1 bash scripts/docker-test.sh` to leave the container up for
+debugging.
 
 ## API
 
