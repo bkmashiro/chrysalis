@@ -106,9 +106,6 @@ run_case "numpy.sum 1-D" \
     '"stdout":"4950'
 
 # ---------- numpy bridge: ndarray return (exercises shm path) ----------
-# _NumpyLike (the WASM-side array proxy) is minimal — no .round / .tolist /
-# arithmetic. We can only check that the bridge round-trips an array result
-# without erroring; reading values out is up to the worker side.
 run_case "numpy.linalg.solve 3x3 (round-trip)" \
     '{"code":"import numpy as np\nA=np.array([[3.,2.,-1.],[2.,-2.,4.],[-1.,0.5,-1.]])\nb=np.array([1.,-2.,0.])\nx=np.linalg.solve(A,b)\nprint(\"shape=\", x.shape)"}' \
     '"status":"ok"'
@@ -116,6 +113,38 @@ run_case "numpy.linalg.solve 3x3 (round-trip)" \
 run_case "numpy.arange large (~1MB)" \
     '{"code":"import numpy as np\na=np.arange(125000, dtype=np.float64)\nprint(int(np.sum(a)))"}' \
     '"stdout":"7812437500'
+
+# ---------- _TensorView universal ops (PR-1) ----------
+# Exercise the package-agnostic flat-bytes view: indexing, iteration, tolist,
+# multi-dim selection. No numpy-side support needed beyond the bytes-and-shape
+# the worker already produces.
+run_case "tensor: 1-D int indexing" \
+    '{"code":"import numpy as np\nprint(np.arange(5)[3])"}' \
+    '"stdout":"3'
+
+run_case "tensor: iteration" \
+    '{"code":"import numpy as np\nprint(sum(int(x) for x in np.arange(4)))"}' \
+    '"stdout":"6'
+
+run_case "tensor: 1-D slice + tolist" \
+    '{"code":"import numpy as np\nprint(np.arange(5)[1:4].tolist())"}' \
+    '"stdout":"\[1, 2, 3\]'
+
+run_case "tensor: 2-D first-axis indexing" \
+    '{"code":"import numpy as np\nprint(np.eye(3)[0].tolist())"}' \
+    '"stdout":"\[1.0, 0.0, 0.0\]'
+
+run_case "tensor: multi-dim tuple index" \
+    '{"code":"import numpy as np\nprint(np.eye(3)[1,1])"}' \
+    '"stdout":"1.0'
+
+run_case "tensor: linalg.solve actual values" \
+    '{"code":"import numpy as np\nA=np.array([[3.,2.],[1.,4.]]); b=np.array([7.,10.])\nx=np.linalg.solve(A,b)\nprint(round(float(x[0]),4), round(float(x[1]),4))"}' \
+    '"stdout":"0.8 2.3'
+
+run_case "tensor: large array short repr" \
+    '{"code":"import numpy as np\nr=repr(np.arange(1000))\nprint(len(r) < 100, \"size=1000\" in r)"}' \
+    '"stdout":"True True'
 
 # ---------- scipy ----------
 run_case "scipy.linalg.det 2x2" \
@@ -164,6 +193,12 @@ run_case "timeout: bridge loop killed" \
 run_case "user runtime error reported" \
     '{"code":"x = 1/0"}' \
     'ZeroDivisionError|"status":"error"'
+
+# Sync-only scope: passing a callable to a bridged function must fail at the
+# shim with a clear TypeError, not silently misbehave on the worker side.
+run_case "callable args rejected (sync-only scope)" \
+    '{"code":"import scipy.optimize as so\ndef f(x): return x*x\nso.brentq(f, 0, 10)"}' \
+    'callable arguments to bridged functions are not supported'
 
 echo ""
 if [[ $FAIL -eq 0 ]]; then

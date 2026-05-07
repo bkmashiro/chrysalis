@@ -213,6 +213,11 @@ def _deser(obj: dict):
         return {k: _deser(v) for k, v in obj.get("value", {}).items()}
     if t == "ndarray":
         return _deser_array(obj)
+    if t == "bridge_ref":
+        # WASM-side proxy for a bridged name (e.g. np.float64 passed as dtype=).
+        # Resolve back to the live worker-side object. The name rides in
+        # `value` since Go's worker.Arg struct has no dedicated field.
+        return _resolve_attr(obj.get("value", ""))
     return obj.get("value")
 
 

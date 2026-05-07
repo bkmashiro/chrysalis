@@ -42,6 +42,7 @@ Chrysalis runs untrusted Python in a WASM sandbox and proxies allowlisted numpy/
 - **The safety pre-check is heuristic.** WASM SFI is the actual boundary. Don't add features that depend on the regex catching everything; add filter rules instead.
 - **Tight Python loops cannot be preempted by `context.WithTimeout`.** wazero only checks the context at WASI yield points (file/pipe I/O, polling). A pure CPU loop like `while True: i+=1` will run until the WASM module exits naturally; the request goroutine survives until the user code yields. Loops that touch the bridge each iteration (e.g. `while True: np.dot(...)`) preempt fine. Real CPU-fuel cancellation needs wazero's experimental hooks or a fork+rlimit fallback (Phase 2 design item).
 - **Float `.0` is dropped in transit.** Worker returns numpy floats as `{"type":"scalar","value":32.0}`; Go's `encoding/json` re-marshals `float64(32.0)` as `"32"`. Cosmetic-only — use `repr()` or formatted printing if exact text matters.
+- **Sync-only scope.** Callable arguments to bridged functions raise `TypeError` at the shim (`bootstrap.py::_ser_one`). `scipy.optimize.minimize`, `brentq`, etc. are out of reach until callback infra lands. The path is the synchronous wire protocol in `docs/design.md §8.2-8.6` plus worker-side concurrency, with the WASM-side transparency layer in `docs/async-support.md` on top. All three pieces must land together; do not partially implement.
 
 ### Directory orientation
 

@@ -1005,6 +1005,24 @@ This design means the worker never needs to be restarted when the filter profile
 
 ## 8. Bidirectional Callbacks
 
+> **Scope note (current implementation): NOT IMPLEMENTED.** Chrysalis is sync-only.
+> Callable arguments to bridged functions raise `TypeError` at the WASM shim
+> boundary (`shim/bootstrap.py::_ser_one`).
+>
+> §8.2-8.6 below are the **synchronous callback wire protocol** and remain the
+> intended foundation. Building on top of that, [`docs/async-support.md`](async-support.md)
+> describes a thin WASM-side transparency layer (`_BridgeResult` /
+> `_drive_coroutine` / `_maybe_sync`, ~50 LOC) that makes async user code work
+> over the same callback machinery without an event loop in the sandbox.
+>
+> Two prerequisites remain before either ships, and they must land together:
+> 1. The synchronous callback protocol below (§8.2-8.6).
+> 2. Worker-side concurrency (threading or worker pool) so that nested
+>    bridge calls from inside a callback do not deadlock on the worker
+>    mutex. See `docs/async-support.md` Case 2 — without (2), an `async
+>    def objective(x): return float(np.dot(x, x))` callback would acquire
+>    the same `Worker.mu` the outer scipy call already holds.
+
 ### 8.1 Problem
 
 Some library functions require user-provided callables. The canonical example:
@@ -1138,6 +1156,31 @@ Callbacks are scoped to a single `shimmy_call` invocation. When the top-level br
 3. The WASM shim clears its `_callbacks` dict
 
 This prevents callback ID reuse attacks across invocations.
+
+### 8.7 Async transparency layer (see `docs/async-support.md`)
+
+The §8.2-8.6 wire protocol is purely synchronous. To support user code that
+uses `async def` / `await`, a thin WASM-side layer sits on top:
+
+- **`_BridgeResult`**: every bridge call returns this wrapper, which delegates
+  all operators to the underlying value AND implements `__await__` returning
+  the value immediately. Sync code (`x = np.dot(a, b)`) and async code
+  (`x = await np.dot(a, b)`) produce identical results.
+- **`_drive_coroutine`**: drives a coroutine to completion without an event
+  loop. Works because there is no real async I/O in the WASM sandbox — every
+  await either resolves to a `_BridgeResult` (immediate) or to another
+  coroutine that also resolves immediately.
+- **`_maybe_sync`**: at callback-registration time, detects coroutine
+  functions and wraps them with `_drive_coroutine`. So
+  `scipy.optimize.minimize(async_objective, x0)` Just Works — scipy sees a
+  sync wrapper.
+
+Total cost ~50 LOC of pure Python, no event loop, no asyncio dependency in
+the sandbox. The full design lives in `docs/async-support.md`.
+
+This layer presupposes the §8.2-8.6 callback wire protocol *and* worker-side
+concurrency for nested-bridge cases (see scope note at the top of this
+section). Until both land, callables are rejected at the shim boundary.
 
 ---
 

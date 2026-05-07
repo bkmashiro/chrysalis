@@ -96,9 +96,25 @@ def _ser_one(obj):
     # numpy-array-like: has shape, dtype, tobytes
     if hasattr(obj, "shape") and hasattr(obj, "dtype") and hasattr(obj, "tobytes"):
         return _ser_array(obj)
+    # Bridged-name proxy (e.g. np.float64 passed as dtype=, np.linalg passed as
+    # a module reference). Pass by name; the worker resolves the live object.
+    # Must come BEFORE the generic callable check — every _BridgedFn is callable.
+    # Use object.__getattribute__ to avoid triggering _ProxyModule.__getattr__,
+    # which would send a worker probe for "_name" / "_ns".
+    if isinstance(obj, _BridgedFn):
+        return {"type": "bridge_ref", "value": object.__getattribute__(obj, "_name")}
+    if isinstance(obj, _ProxyModule):
+        return {"type": "bridge_ref", "value": object.__getattribute__(obj, "_ns")}
     if callable(obj):
-        cb_id = _register_callback(obj)
-        return {"type": "callback", "cb_id": cb_id}
+        # Sync-only scope: user-defined callables are not supported. Async/
+        # coroutine bridging is a long-term direction (docs/design.md §8.7).
+        # Fail fast with a clear message instead of registering a dead cb_id.
+        raise TypeError(
+            "Chrysalis bridge: callable arguments to bridged functions are "
+            "not supported in sync mode (got %r). Inline the computation in "
+            "user code, or split it across multiple /run requests."
+            % type(obj).__name__
+        )
     return {"type": "scalar", "value": str(obj)}
 
 
@@ -131,82 +147,257 @@ def _deser_one(obj):
     if t == "dict":
         return {k: _deser_one(v) for k, v in obj.get("value", {}).items()}
     if t == "ndarray":
-        return _deser_ndarray(obj)
-    if t == "ndarray_inline":
-        return _deser_ndarray_inline(obj)
+        return _deser_tensor(obj)
     return obj.get("value")
 
 
-def _deser_ndarray(obj):
-    """
-    Reconstruct a numpy array from inline base64 bytes.
+def _deser_tensor(obj):
+    """Reconstruct a tensor view from inline base64 bytes.
 
     WASM cannot read /dev/shm, so the host always inlines the raw bytes
-    in the bridge response (in addition to keeping a Go-side shm handle
-    for the case where the array is later passed back through the bridge).
+    in the bridge response (the Go side keeps a shm handle separately for
+    the case where the array is later re-passed through the bridge).
     """
     import base64
     b64 = obj.get("b64", "")
     raw = base64.b64decode(b64) if b64 else b""
     shape = obj.get("shape", [])
     dtype = obj.get("dtype", "float64")
-    # Reconstruct without importing numpy (we ARE the numpy proxy).
-    # Use a bytearray + the _RawArray wrapper.
-    return _NumpyLike(raw, shape, dtype)
+    return _TensorView(raw, shape, dtype)
 
 
-def _deser_ndarray_inline(obj):
-    """Reconstruct from inline base64 bytes."""
-    return _deser_ndarray(obj)
+# ---------------------------------------------------------------------------
+# _TensorView — universal flat-bytes view over a worker-side array
+# ---------------------------------------------------------------------------
+# Knows nothing about numpy / torch / pyarrow — only (shape, dtype, raw bytes).
+# Operations that fit in WASM (indexing, iteration, tolist, repr) are local;
+# anything heavier (multi-dim slicing, arithmetic, reductions) is left to a
+# future re-bridge mechanism (PR-2).
+
+import struct as _struct
+
+# Native-byte-order format chars + itemsize. Matches numpy's str(dtype) for
+# native-endian arrays; non-native byte order is rejected with a TypeError.
+_DTYPE_FMT = {
+    "float64": ("d", 8),
+    "float32": ("f", 4),
+    "int64":   ("q", 8),
+    "int32":   ("i", 4),
+    "int16":   ("h", 2),
+    "int8":    ("b", 1),
+    "uint64":  ("Q", 8),
+    "uint32":  ("I", 4),
+    "uint16":  ("H", 2),
+    "uint8":   ("B", 1),
+    "bool":    ("?", 1),
+}
 
 
-class _NumpyLike:
-    """Minimal array wrapper returned when the real numpy is not available."""
-    def __init__(self, data: bytes, shape, dtype):
-        self._data  = bytearray(data)
-        self.shape  = tuple(shape)
-        self.dtype  = dtype
-        self.nbytes = len(data)
+class _TensorView:
+    """Flat-bytes view over a worker-side array.
+
+    Universal across array libraries — built from (shape, dtype, raw bytes)
+    only. The wire protocol decomposes any sufficiently-array-like result to
+    this form, so numpy.ndarray, torch.Tensor, pyarrow.Array, etc. all map
+    here without library-specific shim code.
+    """
+
+    def __init__(self, data, shape, dtype):
+        self._data    = bytes(data)
+        self.shape    = tuple(shape)
+        self.dtype    = str(dtype)
+        self.ndim     = len(self.shape)
+        self.size     = 1
+        for d in self.shape:
+            self.size *= d
+        self.nbytes   = len(self._data)
+        fmt_size = _DTYPE_FMT.get(self.dtype)
+        if fmt_size is None:
+            self._fmt, self._itemsize = None, 0
+        else:
+            self._fmt, self._itemsize = fmt_size
+
+    # ── Decoding helpers ─────────────────────────────────────────────────
+    def _require_decodable(self):
+        if self._fmt is None:
+            raise TypeError(
+                "Chrysalis _TensorView: unsupported dtype %r "
+                "(only native-endian fixed-width dtypes are decodable in WASM)"
+                % self.dtype
+            )
+
+    def _decode_at(self, flat_idx):
+        self._require_decodable()
+        off = flat_idx * self._itemsize
+        return _struct.unpack_from(self._fmt, self._data, off)[0]
+
+    def _slice_bytes(self, byte_start, byte_stop):
+        return self._data[byte_start:byte_stop]
+
+    # ── Container protocol ───────────────────────────────────────────────
+    def __len__(self):
+        if self.ndim == 0:
+            raise TypeError("len() of 0-d _TensorView")
+        return self.shape[0]
+
+    def __getitem__(self, idx):
+        # Single int — first-axis selection.
+        if isinstance(idx, int):
+            if self.ndim == 0:
+                raise IndexError("invalid index to 0-d _TensorView")
+            n = self.shape[0]
+            if idx < 0:
+                idx += n
+            if idx < 0 or idx >= n:
+                raise IndexError(idx)
+            if self.ndim == 1:
+                return self._decode_at(idx)
+            # Sub-view along leading axis.
+            self._require_decodable()
+            tail_size = self.size // n
+            tail_bytes = tail_size * self._itemsize
+            start = idx * tail_bytes
+            return _TensorView(self._data[start:start + tail_bytes],
+                               self.shape[1:], self.dtype)
+
+        # Slice — 1-D only for now.
+        if isinstance(idx, slice):
+            if self.ndim != 1:
+                raise NotImplementedError(
+                    "_TensorView: multi-dim slicing is not implemented; "
+                    "future PR will route to the worker via re-bridge"
+                )
+            self._require_decodable()
+            start, stop, step = idx.indices(self.shape[0])
+            if step == 1:
+                return _TensorView(
+                    self._data[start * self._itemsize:stop * self._itemsize],
+                    (max(stop - start, 0),), self.dtype,
+                )
+            pieces = []
+            for i in range(start, stop, step):
+                pieces.append(self._data[i * self._itemsize:(i + 1) * self._itemsize])
+            return _TensorView(b"".join(pieces), (len(pieces),), self.dtype)
+
+        # All-int tuple — multi-dim flat-offset (row-major).
+        if isinstance(idx, tuple):
+            if not all(isinstance(x, int) for x in idx):
+                raise NotImplementedError(
+                    "_TensorView: only all-int tuple indexing is implemented"
+                )
+            if len(idx) > self.ndim:
+                raise IndexError("too many indices")
+            if len(idx) < self.ndim:
+                # Partial tuple — same as recursive [i0][i1]...
+                view = self
+                for i in idx:
+                    view = view[i]
+                return view
+            # Full index — flat offset.
+            flat = 0
+            stride = 1
+            for size, i in zip(reversed(self.shape), reversed(idx)):
+                if i < 0:
+                    i += size
+                if i < 0 or i >= size:
+                    raise IndexError(idx)
+                flat += i * stride
+                stride *= size
+            return self._decode_at(flat)
+
+        raise TypeError("_TensorView: unsupported index type %r"
+                        % type(idx).__name__)
+
+    def __iter__(self):
+        if self.ndim == 0:
+            yield self._decode_at(0)
+            return
+        for i in range(self.shape[0]):
+            yield self[i]
+
+    def __contains__(self, value):
+        for x in self:
+            if x == value:
+                return True
+        return False
+
+    # ── Conversions ──────────────────────────────────────────────────────
+    def tolist(self):
+        if self.ndim == 0:
+            return self._decode_at(0)
+        if self.ndim == 1:
+            return [self._decode_at(i) for i in range(self.shape[0])]
+        return [self[i].tolist() for i in range(self.shape[0])]
 
     def tobytes(self):
-        return bytes(self._data)
+        return self._data
 
-    def __repr__(self):
-        return f"<NumpyLike shape={self.shape} dtype={self.dtype}>"
-
-    # Allow float conversion for scalar results.
+    # ── Scalar conversions for size-1 views ──────────────────────────────
     def __float__(self):
-        import struct as _s
-        fmt = {"float64": "d", "float32": "f", "int32": "i", "int64": "q"}.get(self.dtype, "d")
-        return _s.unpack(fmt, self._data[:_s.calcsize(fmt)])[0]
+        if self.size != 1:
+            raise TypeError("only size-1 _TensorView can be converted to float")
+        return float(self._decode_at(0))
 
     def __int__(self):
-        return int(float(self))
+        if self.size != 1:
+            raise TypeError("only size-1 _TensorView can be converted to int")
+        return int(self._decode_at(0))
+
+    def __bool__(self):
+        if self.size != 1:
+            raise ValueError(
+                "truth value of multi-element _TensorView is ambiguous"
+            )
+        return bool(self._decode_at(0))
+
+    def __index__(self):
+        if self.size != 1 or "int" not in self.dtype:
+            raise TypeError("only size-1 integer _TensorView is index-able")
+        return int(self._decode_at(0))
+
+    # ── Repr / str ───────────────────────────────────────────────────────
+    def __repr__(self):
+        if self.ndim == 0:
+            try:
+                return "TensorView(%r, dtype=%r)" % (self._decode_at(0), self.dtype)
+            except Exception:
+                return "TensorView(<undecodable>, dtype=%r)" % self.dtype
+        if self.size <= 12 and self._fmt is not None:
+            try:
+                return "TensorView(%r, dtype=%r)" % (self.tolist(), self.dtype)
+            except Exception:
+                pass
+        return "TensorView(shape=%r, dtype=%r, size=%d)" % (
+            self.shape, self.dtype, self.size,
+        )
 
     def __str__(self):
-        if len(self._data) <= 8:
+        # Make 0-d views print like the bare value (e.g. np.dot scalar result).
+        if self.ndim == 0 and self._fmt is not None:
             try:
-                return str(float(self))
+                return str(self._decode_at(0))
+            except Exception:
+                pass
+        if self.ndim == 1 and self.size <= 12 and self._fmt is not None:
+            try:
+                return str(self.tolist())
             except Exception:
                 pass
         return repr(self)
 
     def __format__(self, spec):
-        return format(str(self), spec)
+        return format(self.__str__(), spec)
 
+    # ── Equality / hashing ───────────────────────────────────────────────
+    def __eq__(self, other):
+        if isinstance(other, _TensorView):
+            return (self.shape == other.shape
+                    and self.dtype == other.dtype
+                    and self._data == other._data)
+        return NotImplemented
 
-# ---------------------------------------------------------------------------
-# Callback registry
-# ---------------------------------------------------------------------------
-_callbacks = {}
-_cb_seq    = 0
-
-def _register_callback(fn):
-    global _cb_seq
-    cid = _cb_seq
-    _cb_seq += 1
-    _callbacks[cid] = fn
-    return cid
+    def __hash__(self):
+        return hash((self.shape, self.dtype, self._data))
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +476,7 @@ class _ProxyModule(types.ModuleType):
         except Exception:
             result = {}
 
-        # result may be a dict (probe response) or a _NumpyLike (shouldn't happen).
+        # result may be a dict (probe response) or a _TensorView (shouldn't happen).
         if isinstance(result, dict):
             is_mod  = result.get("is_module",   False)
             is_call = result.get("is_callable", False)
