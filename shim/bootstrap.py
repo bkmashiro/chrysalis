@@ -18,6 +18,8 @@ import sys
 import io
 import json
 import struct
+import types
+import importlib.machinery
 
 # ---------------------------------------------------------------------------
 # Capture user stdout
@@ -102,15 +104,15 @@ def _ser_one(obj):
 
 def _ser_array(arr):
     """
-    Serialise a numpy array.
+    Serialise an ndarray for the bridge.
 
-    We send the raw bytes as a base64-encoded scalar for simplicity in Phase 1.
-    The Go host writes the bytes to shm and sends back a handle.
+    WASM cannot allocate /dev/shm files, so the bytes are inlined as base64;
+    the Go dispatcher unpacks them into shm before forwarding to the worker.
     """
     import base64
     data_b64 = base64.b64encode(arr.tobytes()).decode("ascii")
     return {
-        "type":   "ndarray_inline",
+        "type":   "ndarray",
         "b64":    data_b64,
         "shape":  list(arr.shape),
         "dtype":  str(arr.dtype),
@@ -137,10 +139,13 @@ def _deser_one(obj):
 
 def _deser_ndarray(obj):
     """
-    Reconstruct a numpy array from a shm handle.
-    For Phase 1 the host returns ndarray_inline; this handles the shm case.
+    Reconstruct a numpy array from inline base64 bytes.
+
+    WASM cannot read /dev/shm, so the host always inlines the raw bytes
+    in the bridge response (in addition to keeping a Go-side shm handle
+    for the case where the array is later passed back through the bridge).
     """
-    import base64, ctypes
+    import base64
     b64 = obj.get("b64", "")
     raw = base64.b64decode(b64) if b64 else b""
     shape = obj.get("shape", [])
@@ -234,10 +239,13 @@ _BRIDGED_TOPS = frozenset(["numpy", "scipy", "pandas"])
 
 
 class _BridgeFinder:
-    def find_module(self, name, path=None):
+    # PEP 451: Python 3.12 dropped the legacy find_module/load_module hooks.
+    def find_spec(self, name, path=None, target=None):
         top = name.split(".")[0]
         if top in _BRIDGED_TOPS:
-            return _BridgeLoader(name)
+            return importlib.machinery.ModuleSpec(
+                name, _BridgeLoader(name), is_package=True,
+            )
         return None
 
 
@@ -245,24 +253,22 @@ class _BridgeLoader:
     def __init__(self, name):
         self.name = name
 
-    def load_module(self, name):
-        if name in sys.modules:
-            return sys.modules[name]
-        mod = _ProxyModule(name)
-        mod.__loader__  = self
-        mod.__package__ = name
-        mod.__path__    = []          # marks it as a package
-        mod.__spec__    = None
-        sys.modules[name] = mod
-        return mod
+    def create_module(self, spec):
+        return _ProxyModule(spec.name)
+
+    def exec_module(self, module):
+        pass
 
 
-class _ProxyModule:
+class _ProxyModule(types.ModuleType):
     """Dynamic proxy: attribute access → bridge probe; call → bridge call."""
 
     def __init__(self, ns: str):
+        super().__init__(ns)
         object.__setattr__(self, "_ns", ns)
         object.__setattr__(self, "_attr_cache", {})
+        # Mark as package so the import system can resolve submodules.
+        self.__path__ = []
 
     def __getattr__(self, attr):
         if attr.startswith("__") and attr.endswith("__"):

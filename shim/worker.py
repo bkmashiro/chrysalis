@@ -27,7 +27,6 @@ import struct
 import json
 import sys
 import os
-import base64
 import importlib
 import mmap
 import traceback
@@ -177,11 +176,26 @@ def _ser(obj) -> dict:
 
 
 def _ser_array(arr) -> dict:
-    """Serialise an ndarray using inline base64 (simpler than shm for results)."""
+    """Serialise an ndarray by writing raw bytes to a shm file.
+
+    The file is created under /dev/shm when available, otherwise tempfile.gettempdir().
+    Go reads the file via encodeNDArrayToShm and unlinks it after copying into its own
+    shm block, so we do not unlink here.
+    """
+    import secrets
     contiguous = np.ascontiguousarray(arr)
+    raw = contiguous.tobytes()
+    name = "chr-worker-" + secrets.token_hex(6)
+    if os.path.isdir("/dev/shm"):
+        path = f"/dev/shm/{name}"
+    else:
+        import tempfile
+        path = os.path.join(tempfile.gettempdir(), name)
+    with open(path, "wb") as f:
+        f.write(raw)
     return {
-        "type":  "ndarray_inline",
-        "b64":   base64.b64encode(contiguous.tobytes()).decode("ascii"),
+        "type":  "ndarray",
+        "value": path,
         "shape": list(contiguous.shape),
         "dtype": str(contiguous.dtype),
     }
@@ -197,18 +211,27 @@ def _deser(obj: dict):
         return [_deser(x) for x in obj.get("value", [])]
     if t == "dict":
         return {k: _deser(v) for k, v in obj.get("value", {}).items()}
-    if t in ("ndarray", "ndarray_inline"):
+    if t == "ndarray":
         return _deser_array(obj)
     return obj.get("value")
 
 
 def _deser_array(obj: dict):
+    """Deserialise an ndarray argument sent by Go.
+
+    Go sets Value to the absolute filesystem path of a shm file containing the raw
+    array bytes (matching resolveArg in dispatcher.go).  We read the file directly
+    and reconstruct the array without base64.
+    """
     if not _has_numpy:
         raise RuntimeError("numpy not available in worker")
-    b64  = obj.get("b64", "")
-    raw  = base64.b64decode(b64)
+    path  = obj.get("value", "")
     dtype = obj.get("dtype", "float64")
     shape = obj.get("shape", [])
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"shm file not found: {path!r}")
+    with open(path, "rb") as fh:
+        raw = fh.read()
     return np.frombuffer(raw, dtype=dtype).reshape(shape).copy()
 
 

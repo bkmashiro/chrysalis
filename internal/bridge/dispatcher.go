@@ -5,6 +5,7 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -266,23 +267,49 @@ func resolveArgs(args []worker.Arg, shmMgr *ShmManager) ([]worker.Arg, error) {
 	return out, nil
 }
 
-// resolveArg converts a client-side ndarray (with shm_handle) to a worker-side ndarray (with shm path).
+// resolveArg converts an ndarray sent from the WASM shim into a worker-bound
+// ndarray whose Value carries the path of a /dev/shm file the worker can read.
+//
+// Two input shapes are accepted:
+//   - inline base64 bytes (B64 set) — WASM-originated; cannot touch /dev/shm itself.
+//     We unpack into a fresh shm block here.
+//   - shm handle (ShmHandle set) — re-passing an array we previously allocated
+//     (e.g. when user code passes a worker result back into another bridged call).
 func resolveArg(a worker.Arg, shmMgr *ShmManager) (worker.Arg, error) {
 	if a.Type != worker.KindNDArray {
 		return a, nil
 	}
+
+	if a.B64 != "" {
+		raw, err := base64.StdEncoding.DecodeString(a.B64)
+		if err != nil {
+			return a, fmt.Errorf("decode ndarray b64: %w", err)
+		}
+		h, slice, err := shmMgr.Alloc(len(raw))
+		if err != nil {
+			return a, fmt.Errorf("alloc shm for ndarray arg: %w", err)
+		}
+		copy(slice, raw)
+		blk, _ := shmMgr.Get(h)
+		return worker.Arg{
+			Type:      worker.KindNDArray,
+			ShmHandle: int(h),
+			Shape:     a.Shape,
+			DType:     a.DType,
+			Value:     shmFilePath(blk.Name),
+		}, nil
+	}
+
 	blk, ok := shmMgr.Get(uint32(a.ShmHandle))
 	if !ok {
 		return a, fmt.Errorf("unknown shm handle %d", a.ShmHandle)
 	}
-	// The worker will read the shm file by path.
 	return worker.Arg{
 		Type:      worker.KindNDArray,
 		ShmHandle: a.ShmHandle,
 		Shape:     a.Shape,
 		DType:     a.DType,
-		// We overload Value to carry the filesystem path to the shm file.
-		Value: shmFilePath(blk.Name),
+		Value:     shmFilePath(blk.Name),
 	}, nil
 }
 
@@ -302,11 +329,14 @@ func encodeNDArrayToShm(arg *worker.Arg, shmMgr *ShmManager) (*worker.Arg, error
 		return arg, nil
 	}
 
-	// Open the file the worker already created.
+	// Open the file the worker already created, then unlink it immediately.
+	// The worker owns creation; Go owns deletion after the copy is done.
 	data, err := readShmFile(shmPath)
 	if err != nil {
 		return nil, fmt.Errorf("read worker shm: %w", err)
 	}
+	// Best-effort unlink — ignore errors (file may already be gone on some platforms).
+	_ = os.Remove(shmPath)
 
 	h, slice, err := shmMgr.Alloc(len(data))
 	if err != nil {
@@ -319,6 +349,8 @@ func encodeNDArrayToShm(arg *worker.Arg, shmMgr *ShmManager) (*worker.Arg, error
 		ShmHandle: int(h),
 		Shape:     arg.Shape,
 		DType:     arg.DType,
+		// Inline the raw bytes for the WASM consumer (which cannot read shm).
+		B64: base64.StdEncoding.EncodeToString(data),
 	}, nil
 }
 

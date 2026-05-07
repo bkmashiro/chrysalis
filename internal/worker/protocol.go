@@ -22,6 +22,10 @@ type Arg struct {
 	DType     string      `json:"dtype,omitempty"`
 	// callback field
 	CbID      int         `json:"cb_id,omitempty"`
+	// B64 is set on bridge responses sent back to the WASM shim for
+	// ndarray return values. WASM cannot read /dev/shm, so the raw array
+	// bytes must be inlined here. Empty for worker-bound traffic.
+	B64       string      `json:"b64,omitempty"`
 }
 
 // Message is the top-level envelope for all wire messages.
