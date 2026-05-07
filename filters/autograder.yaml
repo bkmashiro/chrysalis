@@ -1,0 +1,120 @@
+# filters/autograder.yaml
+# Restricted profile for student code autograding.
+# Only mathematical and array operations are allowed.
+
+name: autograder
+description: "Restricted profile for student code evaluation"
+default: deny
+
+allow:
+  # numpy core
+  - numpy.dot
+  - numpy.matmul
+  - numpy.array
+  - numpy.zeros
+  - numpy.ones
+  - numpy.eye
+  - numpy.arange
+  - numpy.linspace
+  - numpy.reshape
+  - numpy.transpose
+  - numpy.concatenate
+  - numpy.stack
+  - numpy.split
+  - numpy.vstack
+  - numpy.hstack
+
+  # numpy math
+  - numpy.sum
+  - numpy.mean
+  - numpy.std
+  - numpy.var
+  - numpy.min
+  - numpy.max
+  - numpy.abs
+  - numpy.sqrt
+  - numpy.exp
+  - numpy.log
+  - numpy.log2
+  - numpy.log10
+  - numpy.sin
+  - numpy.cos
+  - numpy.tan
+  - numpy.arcsin
+  - numpy.arccos
+  - numpy.arctan
+  - numpy.arctan2
+  - numpy.pi
+  - numpy.e
+  - numpy.inf
+  - numpy.nan
+  - numpy.sort
+  - numpy.argsort
+  - numpy.argmax
+  - numpy.argmin
+  - numpy.cumsum
+  - numpy.cumprod
+  - numpy.prod
+  - numpy.unique
+  - numpy.where
+  - numpy.clip
+  - numpy.round
+  - numpy.floor
+  - numpy.ceil
+  - numpy.sign
+  - numpy.cross
+  - numpy.outer
+  - numpy.inner
+
+  # numpy linalg
+  - numpy.linalg.solve
+  - numpy.linalg.inv
+  - numpy.linalg.det
+  - numpy.linalg.eig
+  - numpy.linalg.eigvals
+  - numpy.linalg.norm
+  - numpy.linalg.svd
+  - numpy.linalg.qr
+  - numpy.linalg.cholesky
+  - numpy.linalg.lstsq
+  - numpy.linalg.matrix_rank
+
+  # numpy random (seeded only)
+  - numpy.random.seed
+  - numpy.random.rand
+  - numpy.random.randn
+  - numpy.random.randint
+  - numpy.random.uniform
+  - numpy.random.normal
+  - numpy.random.shuffle
+  - numpy.random.permutation
+
+  # scipy optimize
+  - scipy.optimize.minimize
+  - scipy.optimize.root
+  - scipy.optimize.fsolve
+  - scipy.optimize.brentq
+
+  # scipy linalg
+  - scipy.linalg.solve
+  - scipy.linalg.lu
+  - scipy.linalg.qr
+  - scipy.linalg.svd
+  - scipy.linalg.inv
+  - scipy.linalg.det
+
+  # probe calls — always allowed (filter checks actual function calls)
+  - "numpy.*.__probe__"
+  - "scipy.*.__probe__"
+  - "numpy.__probe__"
+  - "scipy.__probe__"
+
+deny:
+  # Explicitly deny file I/O
+  - numpy.load
+  - numpy.save
+  - numpy.loadtxt
+  - numpy.savetxt
+  - numpy.genfromtxt
+  - numpy.fromfile
+  - numpy.tofile

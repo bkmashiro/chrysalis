@@ -1,0 +1,40 @@
+# filters/math-only.yaml
+# Minimal profile: pure mathematical functions only, no data structures.
+
+name: math-only
+description: "Mathematical functions only — no array creation or I/O"
+default: deny
+
+allow:
+  - numpy.sin
+  - numpy.cos
+  - numpy.tan
+  - numpy.arcsin
+  - numpy.arccos
+  - numpy.arctan
+  - numpy.arctan2
+  - numpy.exp
+  - numpy.log
+  - numpy.log2
+  - numpy.log10
+  - numpy.sqrt
+  - numpy.abs
+  - numpy.sign
+  - numpy.floor
+  - numpy.ceil
+  - numpy.round
+  - numpy.pi
+  - numpy.e
+  - numpy.inf
+  - numpy.nan
+  - scipy.special.gamma
+  - scipy.special.erf
+  - scipy.special.erfc
+  - scipy.special.factorial
+  - scipy.special.comb
+  - "numpy.__probe__"
+  - "scipy.__probe__"
+  - "numpy.*.__probe__"
+  - "scipy.*.__probe__"
+
+deny: []
