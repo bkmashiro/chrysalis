@@ -50,6 +50,18 @@ type Dispatcher struct {
 	wk       *worker.Worker
 	shimCode []byte // content of bootstrap.py
 	filterDir string
+	// probeCache memoises *.__probe__ responses across all requests.
+	// Probe answers are stable for the worker's lifetime (modules don't
+	// reload), so the cache never needs invalidation. Eliminates one
+	// round-trip per first-touch attribute access (e.g. np.X).
+	// Key: target string (e.g. "numpy.dot"). Value: probeResult.
+	probeCache sync.Map
+}
+
+// probeResult is the cached output of a worker probe call.
+type probeResult struct {
+	IsModule   bool
+	IsCallable bool
 }
 
 // NewDispatcher creates a Dispatcher from a compiled WASM module.
@@ -199,20 +211,27 @@ func (d *Dispatcher) dispatch(ctx context.Context, f *filter.Filter, shmMgr *Shm
 			// Still answer probe for known top-levels even when functions are filtered.
 			// Probes for module-level names always succeed (filtering is on calls).
 		}
-		msg, err := d.wk.Probe(target)
-		if err != nil {
-			return &BridgeResponse{Error: err.Error()}
+
+		var pr probeResult
+		if cached, ok := d.probeCache.Load(target); ok {
+			pr = cached.(probeResult)
+		} else {
+			msg, err := d.wk.Probe(target)
+			if err != nil {
+				return &BridgeResponse{Error: err.Error()}
+			}
+			pr = probeResult{IsModule: msg.IsModule, IsCallable: msg.IsCallable}
+			d.probeCache.Store(target, pr)
 		}
-		val := &worker.Arg{
-			Type: "scalar",
-		}
+
 		// Encode probe result as a dict-like scalar.
-		result := map[string]interface{}{
-			"is_module":   msg.IsModule,
-			"is_callable": msg.IsCallable,
-		}
-		val.Value = result
-		return &BridgeResponse{Value: val}
+		return &BridgeResponse{Value: &worker.Arg{
+			Type: "scalar",
+			Value: map[string]interface{}{
+				"is_module":   pr.IsModule,
+				"is_callable": pr.IsCallable,
+			},
+		}}
 	}
 
 	// Filter check.
