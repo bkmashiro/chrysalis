@@ -200,6 +200,62 @@ run_case "callable args rejected (sync-only scope)" \
     '{"code":"import scipy.optimize as so\ndef f(x): return x*x\nso.brentq(f, 0, 10)"}' \
     'callable arguments to bridged functions are not supported'
 
+# ---------- worker pool: concurrent requests don't serialise ----------
+# Time a single request as a baseline, then issue 4 in parallel and compare.
+# With 4 workers the parallel wall-clock should be ~1× the single time;
+# if requests serialised on one worker it would be ~4×.
+echo "  ${DIM}running concurrency test (single baseline, then 4 parallel)${RESET}"
+SLOW_BODY='{"code":"import numpy as np\nfor i in range(2000):\n    np.dot(np.array([1.0,2.0]), np.array([3.0,4.0]))\nprint(\"done\")","timeout_sec":30}'
+now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+
+# Single request baseline.
+S0=$(now_ms)
+curl -s --max-time 30 -X POST "http://localhost:$PORT/run" \
+    -H 'Content-Type: application/json' --data-raw "$SLOW_BODY" \
+    > "/tmp/conc_$$_baseline.out"
+S1=$(now_ms)
+SINGLE_MS=$((S1 - S0))
+if grep -q '"status":"ok"' "/tmp/conc_$$_baseline.out"; then
+    SINGLE_OK=true
+else
+    SINGLE_OK=false
+    echo "  ${DIM}baseline body: $(head -c 200 /tmp/conc_$$_baseline.out)${RESET}"
+fi
+rm -f "/tmp/conc_$$_baseline.out"
+
+# 4 parallel requests.
+P0=$(now_ms)
+for i in 1 2 3 4; do
+    (curl -s --max-time 30 -X POST "http://localhost:$PORT/run" \
+        -H 'Content-Type: application/json' \
+        --data-raw "$SLOW_BODY" > "/tmp/conc_$$_${i}.out") &
+done
+wait
+P1=$(now_ms)
+PARALLEL_MS=$((P1 - P0))
+
+PAR_OK=true
+for i in 1 2 3 4; do
+    if ! grep -q '"status":"ok"' "/tmp/conc_$$_${i}.out"; then
+        PAR_OK=false
+        echo "  ${DIM}parallel #$i body: $(head -c 200 /tmp/conc_$$_${i}.out)${RESET}"
+    fi
+    rm -f "/tmp/conc_$$_${i}.out"
+done
+
+# Parallel should be no worse than 2× single (4× would mean full serialisation).
+PARALLEL_BUDGET=$((SINGLE_MS * 2))
+if $SINGLE_OK && $PAR_OK && [[ $SINGLE_MS -gt 100 ]] && [[ $PARALLEL_MS -lt $PARALLEL_BUDGET ]]; then
+    printf "  ${GREEN}PASS${RESET}  concurrency: single=%dms 4-parallel=%dms (budget %dms)\n" \
+        "$SINGLE_MS" "$PARALLEL_MS" "$PARALLEL_BUDGET"
+    PASS=$((PASS+1))
+else
+    printf "  ${RED}FAIL${RESET}  concurrency: single=%dms parallel=%dms budget=%dms ok=%s/%s\n" \
+        "$SINGLE_MS" "$PARALLEL_MS" "$PARALLEL_BUDGET" "$SINGLE_OK" "$PAR_OK"
+    FAIL=$((FAIL+1))
+    FAILED_NAMES+=("concurrency: 4 parallel /run vs single baseline")
+fi
+
 echo ""
 if [[ $FAIL -eq 0 ]]; then
     printf "==> ${GREEN}%d passed, 0 failed${RESET}\n" "$PASS"

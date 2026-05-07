@@ -34,4 +34,5 @@ CMD ["./bin/chrysalis", "serve", \
      "--worker", "shim/worker.py", \
      "--shim", "shim/bootstrap.py", \
      "--sock", "/tmp/chrysalis_worker.sock", \
+     "--workers", "4", \
      "--port", "8080"]

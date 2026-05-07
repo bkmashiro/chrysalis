@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 )
 
 // ShmBlock describes an allocated shared-memory segment.
@@ -88,7 +89,30 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)[:n]
 }
 
-// shmName generates a unique shm segment name.
+// shmCounter is incremented for each shm allocation. Combined with a per-pid
+// random suffix, it guarantees uniqueness regardless of allocation rate —
+// 6 hex chars of pure randomness collided via the birthday paradox once we
+// crossed a few thousand allocs per pid (e.g. a /run with thousands of
+// bridge calls).
+var (
+	shmCounter atomic.Uint64
+	shmPidTag  string
+	shmPidOnce sync.Once
+)
+
+func shmPid() string {
+	shmPidOnce.Do(func() {
+		shmPidTag = fmt.Sprintf("%d-%s", os.Getpid(), randomHex(6))
+	})
+	return shmPidTag
+}
+
+// shmName generates a unique shm segment name. Format:
+//
+//	chr-<pid>-<6hex>-<counter>
+//
+// The pid+random tag distinguishes processes; the counter distinguishes
+// allocations within a process and is monotonic.
 func shmName() string {
-	return fmt.Sprintf("chr-%s", randomHex(6))
+	return fmt.Sprintf("chr-%s-%d", shmPid(), shmCounter.Add(1))
 }

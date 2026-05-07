@@ -39,9 +39,10 @@ func serve(args []string) {
 	wasmPath    := fs.String("wasm", "wasm/python.wasm", "path to python.wasm")
 	filterDir   := fs.String("filter-dir", "filters", "directory containing YAML filter profiles")
 	port        := fs.Int("port", 8080, "HTTP listen port")
-	sockPath    := fs.String("sock", "/tmp/chrysalis_worker.sock", "Unix socket for Python worker")
+	sockPath    := fs.String("sock", "/tmp/chrysalis_worker.sock", "base Unix socket path; pool members append .1, .2, ...")
 	workerScript := fs.String("worker", "shim/worker.py", "path to worker.py")
 	shimScript  := fs.String("shim", "shim/bootstrap.py", "path to bootstrap.py")
+	workers     := fs.Int("workers", 4, "size of the Python worker pool (concurrent /run capacity)")
 	_ = fs.Parse(args)
 
 	// Read WASM binary.
@@ -53,8 +54,8 @@ func serve(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Build the pool (compiles WASM, starts worker).
-	p, err := pool.New(ctx, wasmBytes, *workerScript, *shimScript, *filterDir, *sockPath)
+	// Build the pool (compiles WASM, starts worker pool).
+	p, err := pool.New(ctx, wasmBytes, *workerScript, *shimScript, *filterDir, *sockPath, *workers)
 	if err != nil {
 		log.Fatalf("chrysalis: init pool: %v", err)
 	}

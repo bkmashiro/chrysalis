@@ -47,13 +47,14 @@ type RunResult struct {
 type Dispatcher struct {
 	rt       wazero.Runtime
 	compiled wazero.CompiledModule
-	wk       *worker.Worker
+	wkPool   *worker.Pool
 	shimCode []byte // content of bootstrap.py
 	filterDir string
-	// probeCache memoises *.__probe__ responses across all requests.
-	// Probe answers are stable for the worker's lifetime (modules don't
-	// reload), so the cache never needs invalidation. Eliminates one
-	// round-trip per first-touch attribute access (e.g. np.X).
+	// probeCache memoises *.__probe__ responses across all requests AND across
+	// every worker in the pool — probes are deterministic given a fixed Python
+	// env, so the answer is the same regardless of which pool member would
+	// have served it. Eliminates one round-trip per first-touch attribute
+	// access (e.g. np.X).
 	// Key: target string (e.g. "numpy.dot"). Value: probeResult.
 	probeCache sync.Map
 }
@@ -65,11 +66,11 @@ type probeResult struct {
 }
 
 // NewDispatcher creates a Dispatcher from a compiled WASM module.
-func NewDispatcher(rt wazero.Runtime, compiled wazero.CompiledModule, wk *worker.Worker, shimCode []byte, filterDir string) *Dispatcher {
+func NewDispatcher(rt wazero.Runtime, compiled wazero.CompiledModule, wkPool *worker.Pool, shimCode []byte, filterDir string) *Dispatcher {
 	return &Dispatcher{
 		rt:        rt,
 		compiled:  compiled,
-		wk:        wk,
+		wkPool:    wkPool,
 		shimCode:  shimCode,
 		filterDir: filterDir,
 	}
@@ -89,6 +90,15 @@ func (d *Dispatcher) Run(ctx context.Context, code string, filterProfile string,
 		}
 	}
 
+	// Acquire one worker for the entire request. All bridge calls in this
+	// /run hit the same worker so any per-request worker state (e.g. RNG
+	// seed if user does numpy.random.seed(...)) is consistent.
+	wk, releaseWorker, err := d.wkPool.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("acquire worker: %w", err)
+	}
+	defer releaseWorker()
+
 	// Pipes for the stdin/stdout bridge.
 	// bootstrap.py writes bridge requests to its stdout; Go reads from pipeStdoutR.
 	// Go writes bridge responses to pipeStdinW; bootstrap.py reads from its stdin.
@@ -102,9 +112,6 @@ func (d *Dispatcher) Run(ctx context.Context, code string, filterProfile string,
 	// We read it from a special "__stdout__" field in the final message.
 	var stdoutBuf bytes.Buffer
 	var stdoutMu sync.Mutex
-
-	shmMgr := NewShmManager()
-	defer shmMgr.FreeAll()
 
 	// Build the full script: inject bootstrap then user code.
 	fullScript := string(d.shimCode) + "\n\n# ---- user code ----\n" + code + "\n\n# ---- flush ----\n" +
@@ -160,7 +167,7 @@ func (d *Dispatcher) Run(ctx context.Context, code string, filterProfile string,
 				continue
 			}
 
-			resp := d.dispatch(ctx, f, shmMgr, &req)
+			resp := d.dispatch(ctx, wk, f, &req)
 			sendBridgeResponse(pipeStdinW, resp)
 		}
 	}()
@@ -177,8 +184,18 @@ func (d *Dispatcher) Run(ctx context.Context, code string, filterProfile string,
 
 	_, execErr := d.rt.InstantiateModule(ctx, d.compiled, mc)
 
-	// Close the stdout write end so the bridge goroutine terminates.
+	// Wake up the bridge goroutine so it can exit.
+	//
+	// stdoutW.Close() unblocks its next pipeStdoutR.Read with EOF — that's
+	// how the goroutine learns there are no more bridge requests coming.
+	//
+	// stdinR.Close() is the subtle one: if wazero exited mid-cycle (e.g.
+	// timeout on a tight bridge-call loop), the goroutine may currently be
+	// blocked in sendBridgeResponse → pipeStdinW.Write, waiting for a WASM
+	// reader that no longer exists. Closing the read end of that pipe
+	// returns ErrClosedPipe to the writer and lets the goroutine unstick.
 	pipeStdoutW.Close()
+	pipeStdinR.Close()
 	<-bridgeDone
 
 	result := &RunResult{
@@ -200,8 +217,20 @@ func (d *Dispatcher) Run(ctx context.Context, code string, filterProfile string,
 	return result, nil
 }
 
-// dispatch handles a single bridge request from the WASM side.
-func (d *Dispatcher) dispatch(ctx context.Context, f *filter.Filter, shmMgr *ShmManager, req *BridgeRequest) *BridgeResponse {
+// dispatch handles a single bridge request from the WASM side. The worker
+// argument is the one acquired for this /run; all worker-bound traffic for
+// this request goes through it.
+//
+// The shm manager is per-call: shm files are only needed to forward ndarray
+// args from WASM (where we cannot allocate /dev/shm) to the worker (which
+// reads them by path). Once the worker returns, those files are useless and
+// freeing them per-call keeps tmpfs pressure bounded — a request that does
+// thousands of bridge calls used to leak thousands of shm pages until end
+// of /run, which exceeded /dev/shm capacity under concurrency.
+func (d *Dispatcher) dispatch(ctx context.Context, wk *worker.Worker, f *filter.Filter, req *BridgeRequest) *BridgeResponse {
+	shmMgr := NewShmManager()
+	defer shmMgr.FreeAll()
+
 	fn := req.Fn
 
 	// Probe requests: check whether the target is a module or callable.
@@ -216,7 +245,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, f *filter.Filter, shmMgr *Shm
 		if cached, ok := d.probeCache.Load(target); ok {
 			pr = cached.(probeResult)
 		} else {
-			msg, err := d.wk.Probe(target)
+			msg, err := wk.Probe(target)
 			if err != nil {
 				return &BridgeResponse{Error: err.Error()}
 			}
@@ -253,7 +282,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, f *filter.Filter, shmMgr *Shm
 		resolvedKwargs[k] = resolved
 	}
 
-	resp, err := d.wk.Call(fn, resolvedArgs, resolvedKwargs)
+	resp, err := wk.Call(fn, resolvedArgs, resolvedKwargs)
 	if err != nil {
 		return &BridgeResponse{Error: err.Error()}
 	}
@@ -263,7 +292,7 @@ func (d *Dispatcher) dispatch(ctx context.Context, f *filter.Filter, shmMgr *Shm
 
 	// If the result is an ndarray, write it to shm and return a handle.
 	if resp.Value != nil && resp.Value.Type == worker.KindNDArray {
-		encoded, err := encodeNDArrayToShm(resp.Value, shmMgr)
+		encoded, err := encodeNDArrayResult(resp.Value)
 		if err != nil {
 			return &BridgeResponse{Error: err.Error()}
 		}
@@ -332,44 +361,34 @@ func resolveArg(a worker.Arg, shmMgr *ShmManager) (worker.Arg, error) {
 	}, nil
 }
 
-// encodeNDArrayToShm writes the ndarray data returned by the worker into a new shm block.
-// The worker returns ndarray results with Value holding the shm path it wrote to.
-func encodeNDArrayToShm(arg *worker.Arg, shmMgr *ShmManager) (*worker.Arg, error) {
-	// The worker writes the result ndarray to a shm file and returns the path in Value.
-	// The handle table on the Go side is used so the WASM shim can reference it by integer.
-	// In Phase 1 the worker writes raw bytes to the shm file it allocates.
-	// Here we register the shm in our manager.
-	//
-	// For Phase 1: the worker sends back {"type":"ndarray","shm_path":"<path>","shape":[...],"dtype":"..."}
-	// We just pass the handle through.
+// encodeNDArrayResult turns a worker-side ndarray result into the wire form
+// the WASM shim expects: inline base64 bytes plus shape+dtype.
+//
+// The worker writes its result to a /dev/shm file and returns the path in
+// Value; we read+unlink and inline-encode. We do NOT allocate a Go-side
+// shm copy — the WASM shim cannot read /dev/shm regardless, and re-passing
+// an ndarray back into a bridge call always re-encodes inline anyway, so
+// any Go-side shm copy is dead weight that drives tmpfs pressure under
+// concurrency.
+func encodeNDArrayResult(arg *worker.Arg) (*worker.Arg, error) {
 	shmPath, _ := arg.Value.(string)
 	if shmPath == "" {
-		// Scalar path fallback if worker returns inline data.
+		// Scalar path fallback if worker returned inline data.
 		return arg, nil
 	}
 
-	// Open the file the worker already created, then unlink it immediately.
-	// The worker owns creation; Go owns deletion after the copy is done.
 	data, err := readShmFile(shmPath)
 	if err != nil {
 		return nil, fmt.Errorf("read worker shm: %w", err)
 	}
-	// Best-effort unlink — ignore errors (file may already be gone on some platforms).
+	// Worker created the file; Go unlinks once the bytes are read.
 	_ = os.Remove(shmPath)
 
-	h, slice, err := shmMgr.Alloc(len(data))
-	if err != nil {
-		return nil, err
-	}
-	copy(slice, data)
-
 	return &worker.Arg{
-		Type:      worker.KindNDArray,
-		ShmHandle: int(h),
-		Shape:     arg.Shape,
-		DType:     arg.DType,
-		// Inline the raw bytes for the WASM consumer (which cannot read shm).
-		B64: base64.StdEncoding.EncodeToString(data),
+		Type:  worker.KindNDArray,
+		Shape: arg.Shape,
+		DType: arg.DType,
+		B64:   base64.StdEncoding.EncodeToString(data),
 	}, nil
 }
 

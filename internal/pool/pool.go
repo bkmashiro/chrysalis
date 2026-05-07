@@ -28,22 +28,34 @@ type Timing struct {
 	ExecMs  int64
 }
 
-// Pool holds the compiled WASM module and dispatches execution requests.
+// Pool holds the compiled WASM module and a pool of Python workers.
 type Pool struct {
 	rt         wazero.Runtime
 	compiled   wazero.CompiledModule
+	wkPool     *worker.Pool
 	dispatcher *bridge.Dispatcher
 }
 
-// New creates a Pool by compiling the given WASM bytes and starting a Python worker.
-// wasmBytes is the content of python.wasm.
-// workerPath is the path to shim/worker.py.
-// shimPath is the path to shim/bootstrap.py.
-// filterDir is the directory containing YAML filter profiles.
-// sockPath is where the Unix socket for the Python worker will live.
-func New(ctx context.Context, wasmBytes []byte, workerScriptPath, shimPath, filterDir, sockPath string) (*Pool, error) {
+// New creates a Pool by compiling the given WASM bytes and starting `workers`
+// Python worker subprocesses.
+//
+//	wasmBytes        — content of python.wasm
+//	workerScriptPath — shim/worker.py
+//	shimPath         — shim/bootstrap.py
+//	filterDir        — directory of YAML filter profiles
+//	sockPath         — base Unix-socket path; pool members get unique suffixes
+//	                   (e.g. /tmp/chrysalis_worker.sock.1, .2, …)
+//	workers          — pool size (>= 1)
+func New(ctx context.Context, wasmBytes []byte, workerScriptPath, shimPath, filterDir, sockPath string, workers int) (*Pool, error) {
 	// Compile the WASM module once.
-	rt := wazero.NewRuntime(ctx)
+	// CloseOnContextDone makes wazero close in-flight modules when their
+	// per-request context is cancelled (e.g. the user's timeout_sec elapses).
+	// Without it, a tight WASM loop with no host-call yield points runs
+	// forever; with it, the next host-function call observes ctx.Err() and
+	// the module exits promptly.
+	rt := wazero.NewRuntimeWithConfig(ctx,
+		wazero.NewRuntimeConfig().WithCloseOnContextDone(true),
+	)
 
 	if err := bridge.InstantiateWASI(ctx, rt); err != nil {
 		return nil, fmt.Errorf("instantiate WASI: %w", err)
@@ -63,18 +75,19 @@ func New(ctx context.Context, wasmBytes []byte, workerScriptPath, shimPath, filt
 		return nil, fmt.Errorf("read shim %s: %w", shimPath, err)
 	}
 
-	// Start the Python worker.
-	log.Println("chrysalis: starting Python worker…")
-	wk, err := worker.Start(sockPath, workerScriptPath)
+	// Start the worker pool — N processes in parallel.
+	log.Printf("chrysalis: starting worker pool (size=%d)…", workers)
+	wkPool, err := worker.NewPool(ctx, workers, sockPath, workerScriptPath)
 	if err != nil {
-		return nil, fmt.Errorf("start worker: %w", err)
+		return nil, fmt.Errorf("start worker pool: %w", err)
 	}
 
-	disp := bridge.NewDispatcher(rt, compiled, wk, shimCode, filterDir)
+	disp := bridge.NewDispatcher(rt, compiled, wkPool, shimCode, filterDir)
 
 	return &Pool{
 		rt:         rt,
 		compiled:   compiled,
+		wkPool:     wkPool,
 		dispatcher: disp,
 	}, nil
 }
@@ -106,7 +119,10 @@ func (p *Pool) Run(ctx context.Context, code, filterProfile string, timeoutSec i
 	}, nil
 }
 
-// Close shuts down the runtime and worker.
+// Close shuts down the runtime and the worker pool.
 func (p *Pool) Close(ctx context.Context) {
+	if p.wkPool != nil {
+		p.wkPool.Close()
+	}
 	_ = p.rt.Close(ctx)
 }
